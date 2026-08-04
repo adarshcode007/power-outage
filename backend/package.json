@@ -8,7 +8,9 @@
     "start": "tsx src/index.ts",
     "seed": "tsx src/seed.ts",
     "db:push": "prisma db push --accept-data-loss",
-    "prisma:generate": "prisma generate"
+    "prisma:generate": "prisma generate",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "keywords": [],
   "author": "",
@@ -34,6 +36,7 @@
   "devDependencies": {
     "@types/node": "^26.1.2",
     "tsx": "^4.23.5",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "vitest": "^2.1.9"
   }
 }

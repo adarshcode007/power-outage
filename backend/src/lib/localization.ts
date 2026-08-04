@@ -127,6 +127,10 @@ function subtreeDarkness(subtreeIds: string[], tree: Map<string, TreeNode>) {
   return { darkIds, liveIds };
 }
 
+function liveChildren(node: TreeNode, tree: Map<string, TreeNode>) {
+  return node.children.filter((childId) => tree.get(childId)?.energized === true);
+}
+
 async function closeIncidents(tx: Prisma.TransactionClient, scopeType: string, scopeIds: string[], fingerprintsToKeep: Set<string>) {
   const incidents = await tx.incident.findMany({
     where: {
@@ -178,7 +182,7 @@ async function upsertIncident(
   tx: Prisma.TransactionClient,
   data: {
     fingerprint: string;
-    faultType: "span" | "dt" | "feeder";
+    faultType: "span" | "dt" | "feeder" | "sensor";
     scopeType: string;
     scopeId: string;
     spanFromPoleId: string | null;
@@ -350,12 +354,57 @@ async function reconcileDt(tx: Prisma.TransactionClient, dtId: string) {
     return { createdOrUpdated, closed, fingerprints: [...desiredFingerprints] };
   }
 
+  const sensorCandidates: Array<{
+    poleId: string;
+    liveChildIds: string[];
+  }> = [];
   const candidates: Array<{
     fromPoleId: string;
     toPoleId: string;
     darkIds: string[];
     subtreeIds: string[];
   }> = [];
+
+  for (const pole of poleSnapshots) {
+    const node = tree.get(pole.poleId);
+    if (!node || node.energized) {
+      continue;
+    }
+
+    const liveChildIds = liveChildren(node, tree);
+    if (liveChildIds.length > 0) {
+      sensorCandidates.push({ poleId: pole.poleId, liveChildIds });
+    }
+  }
+
+  for (const candidate of sensorCandidates) {
+    const pole = poleMap.get(candidate.poleId);
+    if (!pole) {
+      continue;
+    }
+
+    const fingerprint = `dt:${dtId}:sensor:${candidate.poleId}`;
+    desiredFingerprints.add(fingerprint);
+    const reason = `Pole ${candidate.poleId} is dark, but ${candidate.liveChildIds.length} downstream poles remain live.`;
+
+    await upsertIncident(tx, {
+      fingerprint,
+      faultType: "sensor",
+      scopeType: "dt",
+      scopeId: dtId,
+      spanFromPoleId: null,
+      spanToPoleId: null,
+      lat: pole.lat,
+      lon: pole.lon,
+      pincode: pole.pincode ?? firstAvailablePincode(candidate.liveChildIds, poleMap),
+      affectedPolesCount: 1,
+      downstreamPolesCount: candidate.liveChildIds.length,
+      confidence: 0.91,
+      reason,
+      memberPoleIds: [candidate.poleId],
+    });
+    createdOrUpdated += 1;
+  }
 
   const visit = (poleId: string): void => {
     const node = tree.get(poleId);
