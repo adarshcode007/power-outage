@@ -51,7 +51,10 @@ export type PoleStateRow = {
 export type DeviceStateRow = {
   deviceId: string;
   online: boolean;
+  bootCount: number;
   lastSeq: number | null;
+  lastEventType: "heartbeat" | "power_lost" | "power_restored" | "boot" | null;
+  lastEventAt: Date | null;
   lastHeartbeatAt: Date | null;
   lastTelemetryId: string | null;
 };
@@ -269,7 +272,10 @@ export function buildSyntheticNetwork(options: BuildSyntheticNetworkOptions): Sy
           deviceStates.push({
             deviceId,
             online: true,
+            bootCount: 0,
             lastSeq: randomInt(rng, 1_000, 98_000),
+            lastEventType: "heartbeat",
+            lastEventAt: now,
             lastHeartbeatAt: now,
             lastTelemetryId: null,
           });
@@ -337,7 +343,10 @@ export function buildSyntheticNetwork(options: BuildSyntheticNetworkOptions): Sy
             deviceStates.push({
               deviceId,
               online: true,
+              bootCount: 0,
               lastSeq: randomInt(rng, 1_000, 98_000),
+              lastEventType: "heartbeat",
+              lastEventAt: now,
               lastHeartbeatAt: now,
               lastTelemetryId: null,
             });

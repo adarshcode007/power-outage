@@ -146,6 +146,7 @@ model TelemetryEvent {
   deviceId     String
   poleId       String
   event        TelemetryEventType
+  bootCount    Int                @default(0)
   energized    Boolean
   tsDevice     DateTime
   seq          Int
@@ -175,14 +176,17 @@ model PoleState {
 }
 
 model DeviceState {
-  id              String    @id @default(cuid())
-  deviceId        String    @unique
+  id              String             @id @default(cuid())
+  deviceId        String             @unique
   online          Boolean
+  bootCount       Int                @default(0)
   lastSeq         Int?
+  lastEventType   TelemetryEventType?
+  lastEventAt     DateTime?
   lastHeartbeatAt DateTime?
   lastTelemetryId String?
-  updatedAt       DateTime  @updatedAt
-  device          Device    @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+  updatedAt       DateTime           @updatedAt
+  device          Device             @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
 }
 
 model TopologyEdge {
@@ -226,28 +230,29 @@ model ScheduledOutage {
 }
 
 model Incident {
-  id                 String          @id @default(cuid())
-  status             IncidentStatus  @default(detected)
-  faultType          FaultType       @default(unknown)
-  confidence         Float           @default(0)
-  scopeType          String
-  scopeId            String?
-  spanFromPoleId     String?
-  spanToPoleId       String?
-  lat                Float?
-  lon                Float?
-  pincode            String?
-  affectedPolesCount Int             @default(0)
-  downstreamPolesCount Int           @default(0)
-  reason             String
-  createdAt          DateTime        @default(now())
-  updatedAt          DateTime        @updatedAt
-  detectedAt         DateTime        @default(now())
-  resolvedAt         DateTime?
-  verifiedAt         DateTime?
-  closedAt           DateTime?
-  ticket             Ticket?
-  members            IncidentMember[]
+  id                   String          @id @default(cuid())
+  fingerprint          String          @unique
+  status               IncidentStatus  @default(detected)
+  faultType            FaultType       @default(unknown)
+  confidence           Float           @default(0)
+  scopeType            String
+  scopeId              String?
+  spanFromPoleId       String?
+  spanToPoleId         String?
+  lat                  Float?
+  lon                  Float?
+  pincode              String?
+  affectedPolesCount   Int             @default(0)
+  downstreamPolesCount Int             @default(0)
+  reason               String
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+  detectedAt           DateTime        @default(now())
+  resolvedAt           DateTime?
+  verifiedAt           DateTime?
+  closedAt             DateTime?
+  ticket               Ticket?
+  members              IncidentMember[]
 
   @@index([status])
   @@index([faultType])

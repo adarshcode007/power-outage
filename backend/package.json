@@ -7,7 +7,7 @@
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "seed": "tsx src/seed.ts",
-    "db:push": "prisma db push",
+    "db:push": "prisma db push --accept-data-loss",
     "prisma:generate": "prisma generate"
   },
   "keywords": [],
