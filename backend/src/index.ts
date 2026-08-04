@@ -3,6 +3,8 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { ZodError } from "zod";
 import { prisma } from "./lib/prisma.js";
+import { loadSyntheticNetwork } from "./lib/network-loader.js";
+import { inferTopologyOrder } from "./lib/topology.js";
 import { ingestTelemetry } from "./lib/telemetry.js";
 import { advanceIncidentWorkflow, parseWorkflowAction } from "./lib/workflow.js";
 import { listSimulatorTargets, parseSimulatorFault, parseSimulatorNoise, simulateFault, simulateNoise, simulateNoiseRepair, simulateRepair } from "./lib/simulator.js";
@@ -40,6 +42,89 @@ app.get("/api/network/summary", async () => {
     poles,
     devices,
     scheduledOutages: outages,
+    incidents,
+  };
+});
+
+app.get("/api/network", async () => {
+  const [feeders, transformers, poles, devices, outages] = await Promise.all([
+    prisma.feeder.findMany({ select: { feederId: true, name: true, substationId: true } }),
+    prisma.transformer.findMany({ select: { dtId: true, feederId: true, lat: true, lon: true, capacityKva: true, householdsServed: true } }),
+    prisma.pole.findMany({ select: { poleId: true, feederId: true, dtId: true, lat: true, lon: true, seqOnLine: true, parentPoleId: true, poleType: true, ward: true, pincode: true, deviceId: true } }),
+    prisma.device.findMany({ select: { deviceId: true, poleId: true, firmwareVersion: true, active: true } }),
+    prisma.scheduledOutage.findMany({ select: { externalId: true, scope: true, targetId: true, startsAt: true, endsAt: true, reason: true, status: true } }),
+  ]);
+
+  return {
+    feeders,
+    transformers,
+    poles,
+    devices,
+    outages,
+  };
+});
+
+app.get("/api/network/dt/:dtId", async (request, reply) => {
+  const { dtId } = request.params as { dtId: string };
+
+  const transformer = await prisma.transformer.findUnique({
+    where: { dtId },
+    select: { dtId: true, feederId: true, lat: true, lon: true, capacityKva: true, householdsServed: true },
+  });
+
+  if (!transformer) {
+    return reply.code(404).send({ error: "dt_not_found" });
+  }
+
+  const [poles, devices, incidents, latestInference] = await Promise.all([
+    prisma.pole.findMany({
+      where: { dtId },
+      select: { poleId: true, feederId: true, dtId: true, lat: true, lon: true, seqOnLine: true, parentPoleId: true, poleType: true, ward: true, pincode: true, deviceId: true },
+      orderBy: [{ seqOnLine: "asc" }, { poleId: "asc" }],
+    }),
+    prisma.device.findMany({ where: { pole: { dtId } }, select: { deviceId: true, poleId: true, firmwareVersion: true, active: true, lastSeenAt: true, batteryMv: true, rssi: true } }),
+    prisma.incident.findMany({ where: { scopeType: "dt", scopeId: dtId }, orderBy: [{ createdAt: "desc" }], take: 10, include: { ticket: true } }),
+    prisma.topologyInferenceRun.findFirst({ where: { dtId }, orderBy: [{ createdAt: "desc" }] }),
+  ]);
+
+  const topology = inferTopologyOrder(
+    poles.map((pole) => ({
+      poleId: pole.poleId,
+      lat: pole.lat,
+      lon: pole.lon,
+      seqOnLine: pole.seqOnLine,
+      parentPoleId: pole.parentPoleId,
+      deviceId: pole.deviceId,
+    })),
+    transformer,
+  );
+  const poleStateMap = new Map(
+    (
+      await prisma.poleState.findMany({
+        where: { poleId: { in: poles.map((pole) => pole.poleId) } },
+        select: { poleId: true, energized: true },
+      })
+    ).map((state) => [state.poleId, state.energized]),
+  );
+
+  return {
+    transformer,
+    topology: {
+      mode: topology.mode,
+      confidence: topology.confidence,
+      reason: topology.reason,
+      orderedPoleIds: topology.orderedPoleIds,
+      latestInference,
+    },
+    poles: poles.map((pole) => ({
+      ...pole,
+      energized: poleStateMap.get(pole.poleId) ?? true,
+      orderIndex: topology.orderedPoleIds.indexOf(pole.poleId),
+      topologyMode: topology.mode,
+      topologyConfidence: topology.confidence,
+      topologyReason: topology.reason,
+    })),
+    devices,
     incidents,
   };
 });
@@ -202,6 +287,56 @@ app.post("/api/simulator/noise-repair", async (request, reply) => {
       return reply.code(400).send({ error: "simulator_noise_repair_failed", message: error.message });
     }
     return reply.code(500).send({ error: "simulator_noise_repair_failed" });
+  }
+});
+
+app.get("/api/scheduled-outages", async () => {
+  return prisma.scheduledOutage.findMany({
+    orderBy: [{ startsAt: "asc" }],
+  });
+});
+
+app.post("/api/simulator/load", async (request, reply) => {
+  try {
+    const body = (request.body ?? {}) as { seed?: string };
+    const summary = await loadSyntheticNetwork(body.seed);
+    return reply.send({ loaded: true, ...summary });
+  } catch (error) {
+    if (error instanceof Error) {
+      return reply.code(400).send({ error: "simulator_load_failed", message: error.message });
+    }
+    return reply.code(500).send({ error: "simulator_load_failed" });
+  }
+});
+
+app.post("/api/ai/incident-summary", async (request, reply) => {
+  try {
+    const body = (request.body ?? {}) as { incidentId?: string };
+    if (!body.incidentId) {
+      return reply.code(400).send({ error: "invalid_ai_payload", message: "incidentId is required" });
+    }
+
+    const incident = await prisma.incident.findUnique({
+      where: { id: body.incidentId },
+      include: { ticket: true },
+    });
+
+    if (!incident) {
+      return reply.code(404).send({ error: "incident_not_found" });
+    }
+
+    return reply.send({
+      incidentId: incident.id,
+      fallback: true,
+      summary: `Likely ${incident.faultType} issue on ${incident.scopeType} ${incident.scopeId ?? "unknown"}. ${incident.reason}`,
+      whatChanged: incident.ticket?.status ?? incident.status,
+      confidence: incident.confidence,
+    });
+  } catch (error) {
+    if (error instanceof Error) {
+      return reply.code(400).send({ error: "ai_summary_failed", message: error.message });
+    }
+    return reply.code(500).send({ error: "ai_summary_failed" });
   }
 });
 

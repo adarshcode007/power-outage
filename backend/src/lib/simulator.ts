@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { prisma } from "./prisma.js";
+import { inferTopologyOrder } from "./topology.js";
 import { ingestTelemetry } from "./telemetry.js";
 import { reconcileFromPole } from "./localization.js";
 
@@ -219,7 +220,7 @@ async function scopeToPoles(input: SimulatorFaultInput): Promise<{ scopeName: st
 
   const poles = await prisma.pole.findMany({
     where: { dtId: input.targetId },
-    select: { poleId: true, parentPoleId: true },
+    select: { poleId: true, parentPoleId: true, seqOnLine: true, lat: true, lon: true, deviceId: true },
   });
 
   if (poles.length === 0) {
@@ -232,26 +233,63 @@ async function scopeToPoles(input: SimulatorFaultInput): Promise<{ scopeName: st
 
   const explicitFrom = input.spanFromPoleId;
   const explicitTo = input.spanToPoleId;
-  const childrenByParent = new Map<string, string[]>();
-  for (const pole of poles) {
-    if (!pole.parentPoleId) continue;
-    const children = childrenByParent.get(pole.parentPoleId) ?? [];
-    children.push(pole.poleId);
-    childrenByParent.set(pole.parentPoleId, children);
-  }
+  const hasRecordedTopology = poles.some((pole) => pole.seqOnLine !== null || pole.parentPoleId !== null);
 
-  let fromPoleId = explicitFrom ?? null;
-  let toPoleId = explicitTo ?? null;
-  if (!fromPoleId || !toPoleId) {
-    const firstChild = poles.find((pole) => pole.parentPoleId !== null);
-    if (!firstChild?.parentPoleId) {
-      return { scopeName: `span:${input.targetId}`, poleIds: [], triggerPoleId: null, isSpan: true };
+  if (hasRecordedTopology) {
+    const childrenByParent = new Map<string, string[]>();
+    for (const pole of poles) {
+      if (!pole.parentPoleId) continue;
+      const children = childrenByParent.get(pole.parentPoleId) ?? [];
+      children.push(pole.poleId);
+      childrenByParent.set(pole.parentPoleId, children);
     }
-    fromPoleId = firstChild.parentPoleId;
-    toPoleId = firstChild.poleId;
+
+    let fromPoleId = explicitFrom ?? null;
+    let toPoleId = explicitTo ?? null;
+    if (!fromPoleId || !toPoleId) {
+      const firstChild = poles.find((pole) => pole.parentPoleId !== null);
+      if (!firstChild?.parentPoleId) {
+        return { scopeName: `span:${input.targetId}`, poleIds: [], triggerPoleId: null, isSpan: true };
+      }
+      fromPoleId = firstChild.parentPoleId;
+      toPoleId = firstChild.poleId;
+    }
+
+    const subtree = buildSubtree(toPoleId, childrenByParent);
+    return { scopeName: `span:${fromPoleId}->${toPoleId}`, poleIds: subtree, triggerPoleId: toPoleId, isSpan: true };
   }
 
-  const subtree = buildSubtree(toPoleId, childrenByParent);
+  const transformer = await prisma.transformer.findUnique({
+    where: { dtId: input.targetId },
+    select: { lat: true, lon: true },
+  });
+  const topology = inferTopologyOrder(
+    poles.map((pole) => ({
+      poleId: pole.poleId,
+      lat: pole.lat,
+      lon: pole.lon,
+      seqOnLine: pole.seqOnLine,
+      parentPoleId: pole.parentPoleId,
+      deviceId: pole.deviceId,
+    })),
+    transformer,
+  );
+
+  const ordered = topology.orderedPoleIds;
+  if (ordered.length < 2) {
+    return { scopeName: `span:${input.targetId}`, poleIds: [], triggerPoleId: null, isSpan: true };
+  }
+
+  const defaultBoundaryIndex = Math.min(ordered.length - 1, Math.max(1, Math.floor(ordered.length / 2)));
+  const toPoleId = explicitTo && ordered.includes(explicitTo) ? explicitTo : ordered[defaultBoundaryIndex]!;
+  const toIndex = ordered.indexOf(toPoleId);
+  if (toIndex < 1) {
+    return { scopeName: `span:${input.targetId}`, poleIds: [], triggerPoleId: null, isSpan: true };
+  }
+
+  const fromPoleId = explicitFrom && ordered.includes(explicitFrom) ? explicitFrom : ordered[toIndex - 1]!;
+  const subtree = ordered.slice(toIndex);
+
   return { scopeName: `span:${fromPoleId}->${toPoleId}`, poleIds: subtree, triggerPoleId: toPoleId, isSpan: true };
 }
 

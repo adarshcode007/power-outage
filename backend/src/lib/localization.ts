@@ -1,5 +1,6 @@
 import type { Prisma } from "../../generated/prisma/client.js";
 import { prisma } from "./prisma.js";
+import { inferTopologyOrder } from "./topology.js";
 
 type PoleSnapshot = {
   poleId: string;
@@ -10,6 +11,7 @@ type PoleSnapshot = {
   pincode: string | null;
   deviceId: string | null;
   parentPoleId: string | null;
+  seqOnLine: number | null;
   energized: boolean;
 };
 
@@ -102,6 +104,25 @@ function buildTree(poles: PoleSnapshot[]) {
       tree.get(pole.parentPoleId)!.children.push(pole.poleId);
     } else {
       roots.push(pole.poleId);
+    }
+  }
+
+  return { tree, roots };
+}
+
+function buildApproximateTree(poles: PoleSnapshot[], orderedPoleIds: string[]) {
+  const tree = new Map<string, TreeNode>();
+  const roots = orderedPoleIds.length > 0 ? [orderedPoleIds[0]!] : [];
+
+  for (const pole of poles) {
+    tree.set(pole.poleId, { ...pole, children: [] });
+  }
+
+  for (let index = 0; index < orderedPoleIds.length - 1; index += 1) {
+    const current = tree.get(orderedPoleIds[index]!);
+    const next = orderedPoleIds[index + 1];
+    if (current && next && tree.has(next)) {
+      current.children.push(next);
     }
   }
 
@@ -300,6 +321,7 @@ async function reconcileDt(tx: Prisma.TransactionClient, dtId: string) {
       pincode: true,
       deviceId: true,
       parentPoleId: true,
+      seqOnLine: true,
     },
     orderBy: [{ seqOnLine: "asc" }, { poleId: "asc" }],
   });
@@ -323,16 +345,45 @@ async function reconcileDt(tx: Prisma.TransactionClient, dtId: string) {
     energized: poleStates.get(pole.poleId) ?? true,
   }));
   const poleMap = new Map(poleSnapshots.map((pole) => [pole.poleId, pole]));
-  const { tree, roots } = buildTree(poleSnapshots);
-  const allDark = poleSnapshots.every((pole) => !pole.energized);
+  const topology = inferTopologyOrder(
+    poleSnapshots.map((pole) => ({
+      poleId: pole.poleId,
+      lat: pole.lat,
+      lon: pole.lon,
+      seqOnLine: pole.seqOnLine,
+      parentPoleId: pole.parentPoleId,
+      deviceId: pole.deviceId,
+    })),
+    transformer,
+  );
   const desiredFingerprints = new Set<string>();
   let createdOrUpdated = 0;
 
+  if (topology.mode === "inferred") {
+    await tx.topologyInferenceRun.create({
+      data: {
+        dtId,
+        method: "radial-projection-v1",
+        confidence: topology.confidence,
+        inputVersion: "geometry-v1",
+        result: {
+          orderedPoleIds: topology.orderedPoleIds,
+          reason: topology.reason,
+        },
+      },
+    });
+  }
+
+  const allDark = poleSnapshots.every((pole) => !pole.energized);
   if (allDark) {
     const fingerprint = `dt:${dtId}:dtfault`;
     desiredFingerprints.add(fingerprint);
     const affectedPoleIds = poleSnapshots.map((pole) => pole.poleId);
-    const reason = `All ${poleSnapshots.length} poles under ${dtId} are dark.`;
+    const reason =
+      topology.mode === "recorded"
+        ? `All ${poleSnapshots.length} poles under ${dtId} are dark.`
+        : `Approximate DT outage inferred from geometry: all ${poleSnapshots.length} poles under ${dtId} are dark.`;
+
     await upsertIncident(tx, {
       fingerprint,
       faultType: "dt",
@@ -345,7 +396,7 @@ async function reconcileDt(tx: Prisma.TransactionClient, dtId: string) {
       pincode: firstAvailablePincode(affectedPoleIds, poleMap),
       affectedPolesCount: affectedPoleIds.length,
       downstreamPolesCount: affectedPoleIds.length,
-      confidence: 0.9,
+      confidence: topology.mode === "recorded" ? 0.9 : topology.confidence,
       reason,
       memberPoleIds: affectedPoleIds,
     });
@@ -354,6 +405,70 @@ async function reconcileDt(tx: Prisma.TransactionClient, dtId: string) {
     return { createdOrUpdated, closed, fingerprints: [...desiredFingerprints] };
   }
 
+  if (topology.mode === "inferred") {
+    const orderedSnapshots = topology.orderedPoleIds.map((poleId) => poleMap.get(poleId)).filter((pole): pole is PoleSnapshot => Boolean(pole));
+    const firstDarkIndex = orderedSnapshots.findIndex((pole) => !pole.energized);
+
+    if (firstDarkIndex > 0) {
+      const laterLiveIds = orderedSnapshots.slice(firstDarkIndex + 1).filter((pole) => pole.energized).map((pole) => pole.poleId);
+      const firstDarkPole = orderedSnapshots[firstDarkIndex]!;
+
+      if (laterLiveIds.length > 0) {
+        const fingerprint = `dt:${dtId}:sensor:${firstDarkPole.poleId}`;
+        desiredFingerprints.add(fingerprint);
+        const reason = `${topology.reason} Pole ${firstDarkPole.poleId} is dark, but ${laterLiveIds.length} downstream poles remain live.`;
+
+        await upsertIncident(tx, {
+          fingerprint,
+          faultType: "sensor",
+          scopeType: "dt",
+          scopeId: dtId,
+          spanFromPoleId: null,
+          spanToPoleId: null,
+          lat: firstDarkPole.lat,
+          lon: firstDarkPole.lon,
+          pincode: firstDarkPole.pincode ?? firstAvailablePincode(laterLiveIds, poleMap),
+          affectedPolesCount: 1,
+          downstreamPolesCount: laterLiveIds.length,
+          confidence: topology.confidence,
+          reason,
+          memberPoleIds: [firstDarkPole.poleId],
+        });
+        createdOrUpdated += 1;
+      } else {
+        const fromPole = orderedSnapshots[firstDarkIndex - 1]!;
+        const toPole = firstDarkPole;
+        const darkTailIds = orderedSnapshots.slice(firstDarkIndex).map((pole) => pole.poleId);
+        const boundaryMidpoint = midpoint(fromPole, toPole);
+        const fingerprint = `dt:${dtId}:span:${fromPole.poleId}->${toPole.poleId}`;
+        desiredFingerprints.add(fingerprint);
+        const reason = `${topology.reason} Approximate boundary detected between live pole ${fromPole.poleId} and dark pole ${toPole.poleId}; ${darkTailIds.length} downstream poles affected.`;
+
+        await upsertIncident(tx, {
+          fingerprint,
+          faultType: "span",
+          scopeType: "dt",
+          scopeId: dtId,
+          spanFromPoleId: fromPole.poleId,
+          spanToPoleId: toPole.poleId,
+          lat: boundaryMidpoint.lat,
+          lon: boundaryMidpoint.lon,
+          pincode: toPole.pincode ?? firstAvailablePincode(darkTailIds, poleMap),
+          affectedPolesCount: darkTailIds.length,
+          downstreamPolesCount: darkTailIds.length,
+          confidence: topology.confidence,
+          reason,
+          memberPoleIds: darkTailIds,
+        });
+        createdOrUpdated += 1;
+      }
+
+      const closed = await closeIncidents(tx, "dt", [dtId], desiredFingerprints);
+      return { createdOrUpdated, closed, fingerprints: [...desiredFingerprints] };
+    }
+  }
+
+  const { tree, roots } = topology.mode === "recorded" ? buildTree(poleSnapshots) : buildApproximateTree(poleSnapshots, topology.orderedPoleIds);
   const sensorCandidates: Array<{
     poleId: string;
     liveChildIds: string[];
@@ -385,7 +500,10 @@ async function reconcileDt(tx: Prisma.TransactionClient, dtId: string) {
 
     const fingerprint = `dt:${dtId}:sensor:${candidate.poleId}`;
     desiredFingerprints.add(fingerprint);
-    const reason = `Pole ${candidate.poleId} is dark, but ${candidate.liveChildIds.length} downstream poles remain live.`;
+    const reason =
+      topology.mode === "recorded"
+        ? `Pole ${candidate.poleId} is dark, but ${candidate.liveChildIds.length} downstream poles remain live.`
+        : `${topology.reason} Pole ${candidate.poleId} is dark, but ${candidate.liveChildIds.length} downstream poles remain live.`;
 
     await upsertIncident(tx, {
       fingerprint,
@@ -399,7 +517,7 @@ async function reconcileDt(tx: Prisma.TransactionClient, dtId: string) {
       pincode: pole.pincode ?? firstAvailablePincode(candidate.liveChildIds, poleMap),
       affectedPolesCount: 1,
       downstreamPolesCount: candidate.liveChildIds.length,
-      confidence: 0.91,
+      confidence: topology.mode === "recorded" ? 0.91 : topology.confidence,
       reason,
       memberPoleIds: [candidate.poleId],
     });
@@ -444,8 +562,11 @@ async function reconcileDt(tx: Prisma.TransactionClient, dtId: string) {
     const fingerprint = `dt:${dtId}:span:${candidate.fromPoleId}->${candidate.toPoleId}`;
     desiredFingerprints.add(fingerprint);
     const boundaryMidpoint = midpoint(fromPole, toPole);
-    const confidence = clamp(0.95 - (fromPole.deviceId && toPole.deviceId ? 0 : 0.05) - 0.05, 0.5, 0.99);
-    const reason = `Boundary detected between live pole ${candidate.fromPoleId} and dark pole ${candidate.toPoleId}; ${candidate.darkIds.length} downstream poles affected.`;
+    const confidence = topology.mode === "recorded" ? clamp(0.95 - (fromPole.deviceId && toPole.deviceId ? 0 : 0.05) - 0.05, 0.5, 0.99) : topology.confidence;
+    const reason =
+      topology.mode === "recorded"
+        ? `Boundary detected between live pole ${candidate.fromPoleId} and dark pole ${candidate.toPoleId}; ${candidate.darkIds.length} downstream poles affected.`
+        : `${topology.reason} Approximate boundary detected between live pole ${candidate.fromPoleId} and dark pole ${candidate.toPoleId}; ${candidate.darkIds.length} downstream poles affected.`;
 
     await upsertIncident(tx, {
       fingerprint,
@@ -481,6 +602,7 @@ async function reconcileFeeder(tx: Prisma.TransactionClient, feederId: string) {
       pincode: true,
       deviceId: true,
       parentPoleId: true,
+      seqOnLine: true,
     },
   });
 

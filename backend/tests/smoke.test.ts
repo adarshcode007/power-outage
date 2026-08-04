@@ -317,4 +317,53 @@ describe.sequential("smoke tests", () => {
     expect(stale.status).toBe(202);
     expect(stale.body.stale).toBe(1);
   });
+
+  it("exposes network endpoints and infers approximate ranges for missing topology", async () => {
+    const load = await apiJson<Record<string, unknown>>("/api/simulator/load", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    expect(load.status).toBe(200);
+
+    const network = await apiJson<{ feeders: unknown[]; transformers: unknown[]; poles: unknown[]; devices: unknown[]; outages: unknown[] }>("/api/network");
+    expect(network.body.feeders.length).toBeGreaterThan(0);
+    expect(network.body.transformers.length).toBeGreaterThan(0);
+
+    const outages = await apiJson<unknown[]>("/api/scheduled-outages");
+    expect(outages.body.length).toBeGreaterThan(0);
+
+    const targets = await apiJson<{ transformers: SimulatorTarget[] }>("/api/simulator/targets");
+    const target = targets.body.transformers.find((item) => !item.hasRecordedTopology);
+    expect(target).toBeTruthy();
+    if (!target) {
+      throw new Error("no missing-topology DT found");
+    }
+
+    const dt = await apiJson<{ topology: { mode: string; orderedPoleIds: string[] } }>(`/api/network/dt/${target.dtId}`);
+    expect(dt.body.topology.mode).toBe("inferred");
+    expect(dt.body.topology.orderedPoleIds.length).toBeGreaterThan(3);
+
+    const midpoint = Math.floor(dt.body.topology.orderedPoleIds.length / 2);
+    const fromPoleId = dt.body.topology.orderedPoleIds[midpoint - 1];
+    const toPoleId = dt.body.topology.orderedPoleIds[midpoint];
+    if (!fromPoleId || !toPoleId) {
+      throw new Error("missing inferred boundary poles");
+    }
+
+    const startedAt = Date.now();
+    const fault = await apiJson<Record<string, unknown>>("/api/simulator/fault", {
+      method: "POST",
+      body: JSON.stringify({ type: "span", targetId: target.dtId, spanFromPoleId: fromPoleId, spanToPoleId: toPoleId }),
+    });
+    expect(fault.status).toBe(200);
+
+    const incident = await waitForIncident(
+      (item) => item.scopeType === "dt" && item.scopeId === target.dtId && item.faultType === "span" && item.spanFromPoleId === fromPoleId && item.spanToPoleId === toPoleId,
+      15000,
+      startedAt,
+    );
+
+    expect(incident.reason).toContain("Approximate");
+    expect(incident.confidence).toBeLessThan(0.9);
+  });
 });
