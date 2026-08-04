@@ -1,0 +1,64 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: power_outage
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d power_outage"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/power_outage?schema=public
+      PORT: 4000
+      NODE_ENV: development
+      NETWORK_SEED: power-outage-demo
+    ports:
+      - "4000:4000"
+    command: sh -lc "npm run prisma:generate && npm run db:push && npm run seed && npm run dev"
+
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/power_outage?schema=public
+      NODE_ENV: development
+      WORKER_HEARTBEAT_MS: 60000
+    command: npm run dev
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_started
+    environment:
+      PORT: 3000
+      NEXT_PUBLIC_API_URL: http://backend:4000
+    ports:
+      - "3000:3000"
+    command: npm run start
+
+volumes:
+  pgdata:

@@ -1,0 +1,311 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum TelemetryEventType {
+  heartbeat
+  power_lost
+  power_restored
+  boot
+}
+
+enum FaultType {
+  span
+  dt
+  feeder
+  sensor
+  unknown
+}
+
+enum IncidentStatus {
+  detected
+  acknowledged
+  crew_assigned
+  resolved
+  verified
+  closed
+}
+
+enum TicketStatus {
+  detected
+  acknowledged
+  crew_assigned
+  resolved
+  verified
+  closed
+}
+
+enum OutageScope {
+  feeder
+  dt
+}
+
+enum ScheduledOutageStatus {
+  planned
+  active
+  completed
+  cancelled
+}
+
+enum TopologyEdgeSource {
+  recorded
+  inferred
+  synthetic
+}
+
+model Feeder {
+  id            String               @id @default(cuid())
+  feederId      String               @unique
+  name          String?
+  substationId  String?
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+  transformers  Transformer[]
+  poles         Pole[]
+  topologyEdges TopologyEdge[]
+
+  @@index([substationId])
+}
+
+model Transformer {
+  id               String                 @id @default(cuid())
+  dtId             String                 @unique
+  feederId         String
+  lat              Float
+  lon              Float
+  capacityKva      Int
+  householdsServed Int
+  createdAt        DateTime               @default(now())
+  updatedAt        DateTime               @updatedAt
+  feeder           Feeder                 @relation(fields: [feederId], references: [feederId], onDelete: Restrict)
+  poles            Pole[]
+  topologyRuns     TopologyInferenceRun[]
+  topologyEdges    TopologyEdge[]
+
+  @@index([feederId])
+}
+
+model Pole {
+  id             String           @id @default(cuid())
+  poleId         String           @unique
+  feederId       String
+  dtId           String
+  lat            Float
+  lon            Float
+  seqOnLine      Int?
+  parentPoleId   String?
+  poleType       String
+  ward           String
+  pincode        String?
+  deviceId       String?          @unique
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  feeder         Feeder          @relation(fields: [feederId], references: [feederId], onDelete: Restrict)
+  transformer    Transformer     @relation(fields: [dtId], references: [dtId], onDelete: Restrict)
+  parentPole     Pole?           @relation("PoleHierarchy", fields: [parentPoleId], references: [poleId], onDelete: SetNull)
+  childPoles     Pole[]          @relation("PoleHierarchy")
+  telemetry      TelemetryEvent[]
+  poleState      PoleState?
+  device         Device?
+  upstreamEdges  TopologyEdge[]  @relation("TopologyUpstreamPole")
+  downstreamEdges   TopologyEdge[] @relation("TopologyDownstreamPole")
+  incidentMembers    IncidentMember[]
+
+  @@index([feederId])
+  @@index([dtId])
+  @@index([dtId, seqOnLine])
+  @@index([parentPoleId])
+}
+
+model Device {
+  id                String            @id @default(cuid())
+  deviceId          String            @unique
+  poleId            String            @unique
+  firmwareVersion   String
+  installedAt       DateTime          @default(now())
+  lastSeenAt        DateTime?
+  batteryMv         Int?
+  rssi              Int?
+  active            Boolean           @default(true)
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  pole              Pole              @relation(fields: [poleId], references: [poleId], onDelete: Cascade)
+  telemetry         TelemetryEvent[]
+  deviceState       DeviceState?
+
+  @@index([active])
+}
+
+model TelemetryEvent {
+  id           String             @id @default(cuid())
+  deviceId     String
+  poleId       String
+  event        TelemetryEventType
+  energized    Boolean
+  tsDevice     DateTime
+  seq          Int
+  batteryMv    Int?
+  rssi         Int?
+  fw           String
+  receivedAt   DateTime           @default(now())
+  dedupeKey    String             @unique
+  rawPayload   Json
+  device       Device             @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+  pole         Pole               @relation(fields: [poleId], references: [poleId], onDelete: Cascade)
+
+  @@index([deviceId, seq])
+  @@index([poleId, tsDevice])
+  @@index([receivedAt])
+}
+
+model PoleState {
+  id              String    @id @default(cuid())
+  poleId          String    @unique
+  energized       Boolean
+  lastEventType   TelemetryEventType?
+  lastEventAt     DateTime?
+  lastTelemetryId String?
+  updatedAt       DateTime  @updatedAt
+  pole            Pole      @relation(fields: [poleId], references: [poleId], onDelete: Cascade)
+}
+
+model DeviceState {
+  id              String    @id @default(cuid())
+  deviceId        String    @unique
+  online          Boolean
+  lastSeq         Int?
+  lastHeartbeatAt DateTime?
+  lastTelemetryId String?
+  updatedAt       DateTime  @updatedAt
+  device          Device    @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+}
+
+model TopologyEdge {
+  id              String             @id @default(cuid())
+  dtId            String
+  feederId        String
+  upstreamPoleId  String?
+  downstreamPoleId String
+  source          TopologyEdgeSource
+  hidden          Boolean            @default(false)
+  confidence      Float              @default(1)
+  pathIndex       Int?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+  transformer     Transformer        @relation(fields: [dtId], references: [dtId], onDelete: Cascade)
+  feeder          Feeder             @relation(fields: [feederId], references: [feederId], onDelete: Cascade)
+  upstreamPole    Pole?              @relation("TopologyUpstreamPole", fields: [upstreamPoleId], references: [poleId], onDelete: SetNull)
+  downstreamPole  Pole               @relation("TopologyDownstreamPole", fields: [downstreamPoleId], references: [poleId], onDelete: Cascade)
+
+  @@index([dtId, source])
+  @@index([feederId, source])
+  @@index([downstreamPoleId])
+  @@unique([downstreamPoleId, source, hidden])
+}
+
+model ScheduledOutage {
+  id          String               @id @default(cuid())
+  externalId  String               @unique
+  scope       OutageScope
+  targetId    String
+  startsAt    DateTime
+  endsAt      DateTime
+  reason      String
+  status      ScheduledOutageStatus @default(planned)
+  source      String               @default("department-feed")
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+
+  @@index([scope, targetId])
+  @@index([startsAt, endsAt])
+}
+
+model Incident {
+  id                 String          @id @default(cuid())
+  status             IncidentStatus  @default(detected)
+  faultType          FaultType       @default(unknown)
+  confidence         Float           @default(0)
+  scopeType          String
+  scopeId            String?
+  spanFromPoleId     String?
+  spanToPoleId       String?
+  lat                Float?
+  lon                Float?
+  pincode            String?
+  affectedPolesCount Int             @default(0)
+  downstreamPolesCount Int           @default(0)
+  reason             String
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+  detectedAt         DateTime        @default(now())
+  resolvedAt         DateTime?
+  verifiedAt         DateTime?
+  closedAt           DateTime?
+  ticket             Ticket?
+  members            IncidentMember[]
+
+  @@index([status])
+  @@index([faultType])
+  @@index([scopeType, scopeId])
+}
+
+model IncidentMember {
+  id          String   @id @default(cuid())
+  incidentId  String
+  poleId      String
+  role        String
+  createdAt   DateTime @default(now())
+  incident    Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  pole        Pole     @relation(fields: [poleId], references: [poleId], onDelete: Cascade)
+
+  @@unique([incidentId, poleId, role])
+  @@index([poleId])
+}
+
+model Ticket {
+  id             String       @id @default(cuid())
+  incidentId     String       @unique
+  status         TicketStatus @default(detected)
+  assignedTo     String?
+  acknowledgedAt DateTime?
+  assignedAt     DateTime?
+  resolvedAt     DateTime?
+  verifiedAt     DateTime?
+  closedAt       DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  incident      Incident     @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+}
+
+model TopologyInferenceRun {
+  id              String     @id @default(cuid())
+  dtId            String
+  method          String
+  confidence      Float
+  inputVersion    String?
+  result          Json
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  transformer     Transformer @relation(fields: [dtId], references: [dtId], onDelete: Cascade)
+
+  @@index([dtId, createdAt])
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  entityType  String
+  entityId    String
+  action      String
+  payload     Json
+  createdAt   DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
