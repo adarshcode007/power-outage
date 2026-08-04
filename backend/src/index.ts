@@ -4,6 +4,7 @@ import cors from "@fastify/cors";
 import { ZodError } from "zod";
 import { prisma } from "./lib/prisma.js";
 import { ingestTelemetry } from "./lib/telemetry.js";
+import { advanceIncidentWorkflow, parseWorkflowAction } from "./lib/workflow.js";
 import { listSimulatorTargets, parseSimulatorFault, simulateFault, simulateRepair } from "./lib/simulator.js";
 
 const logger =
@@ -120,6 +121,24 @@ app.get("/api/incidents/:id", async (request, reply) => {
   }
 
   return incident;
+});
+
+app.post("/api/incidents/:id/workflow", async (request, reply) => {
+  const { id } = request.params as { id: string };
+
+  try {
+    const payload = parseWorkflowAction(request.body);
+    return reply.send(await advanceIncidentWorkflow(id, payload));
+  } catch (error) {
+    if (error instanceof ZodError) {
+      return reply.code(400).send({ error: "invalid_workflow_payload", message: error.message });
+    }
+    if (error instanceof Error) {
+      const statusCode = (error as Error & { statusCode?: number }).statusCode ?? 400;
+      return reply.code(statusCode).send({ error: "workflow_update_failed", message: error.message });
+    }
+    return reply.code(500).send({ error: "workflow_update_failed" });
+  }
 });
 
 app.get("/api/simulator/targets", async () => {
