@@ -4,6 +4,7 @@ import cors from "@fastify/cors";
 import { ZodError } from "zod";
 import { prisma } from "./lib/prisma.js";
 import { ingestTelemetry } from "./lib/telemetry.js";
+import { listSimulatorTargets, parseSimulatorFault, simulateFault, simulateRepair } from "./lib/simulator.js";
 
 const logger =
   process.env.NODE_ENV === "production"
@@ -119,6 +120,40 @@ app.get("/api/incidents/:id", async (request, reply) => {
   }
 
   return incident;
+});
+
+app.get("/api/simulator/targets", async () => {
+  return listSimulatorTargets();
+});
+
+app.post("/api/simulator/fault", async (request, reply) => {
+  try {
+    const input = parseSimulatorFault(request.body);
+    return reply.send(await simulateFault(input));
+  } catch (error) {
+    if (error instanceof ZodError) {
+      return reply.code(400).send({ error: "invalid_simulator_payload", message: error.message });
+    }
+    if (error instanceof Error) {
+      return reply.code(400).send({ error: "simulator_fault_failed", message: error.message });
+    }
+    return reply.code(500).send({ error: "simulator_fault_failed" });
+  }
+});
+
+app.post("/api/simulator/repair", async (request, reply) => {
+  try {
+    const input = parseSimulatorFault(request.body);
+    return reply.send(await simulateRepair(input));
+  } catch (error) {
+    if (error instanceof ZodError) {
+      return reply.code(400).send({ error: "invalid_simulator_payload", message: error.message });
+    }
+    if (error instanceof Error) {
+      return reply.code(400).send({ error: "simulator_repair_failed", message: error.message });
+    }
+    return reply.code(500).send({ error: "simulator_repair_failed" });
+  }
 });
 
 const port = Number(process.env.PORT ?? 4000);
