@@ -67,6 +67,28 @@ function firstAvailablePincode(ids: string[], poles: Map<string, PoleSnapshot>):
   return null;
 }
 
+async function isScheduledOutageActive(
+  tx: Prisma.TransactionClient,
+  scopeType: "feeder" | "dt",
+  scopeId: string,
+): Promise<boolean> {
+  const now = new Date();
+  const graceMs = 40 * 60_000;
+
+  const outage = await tx.scheduledOutage.findFirst({
+    where: {
+      scope: scopeType,
+      targetId: scopeId,
+      status: { not: "cancelled" },
+      startsAt: { lte: new Date(now.getTime() + graceMs) },
+      endsAt: { gte: new Date(now.getTime() - graceMs) },
+    },
+    select: { id: true },
+  });
+
+  return Boolean(outage);
+}
+
 function buildTree(poles: PoleSnapshot[]) {
   const tree = new Map<string, TreeNode>();
   const roots: string[] = [];
@@ -282,6 +304,10 @@ async function reconcileDt(tx: Prisma.TransactionClient, dtId: string) {
     return { createdOrUpdated: 0, closed: 0, fingerprints: [] };
   }
 
+  if (await isScheduledOutageActive(tx, "dt", dtId)) {
+    return { createdOrUpdated: 0, closed: 0, fingerprints: [] };
+  }
+
   const states = await tx.poleState.findMany({
     where: { poleId: { in: poles.map((pole) => pole.poleId) } },
     select: { poleId: true, energized: true },
@@ -410,6 +436,10 @@ async function reconcileFeeder(tx: Prisma.TransactionClient, feederId: string) {
   });
 
   if (poles.length === 0) {
+    return { createdOrUpdated: 0, closed: 0, fingerprints: [] };
+  }
+
+  if (await isScheduledOutageActive(tx, "feeder", feederId)) {
     return { createdOrUpdated: 0, closed: 0, fingerprints: [] };
   }
 

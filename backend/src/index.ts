@@ -5,7 +5,7 @@ import { ZodError } from "zod";
 import { prisma } from "./lib/prisma.js";
 import { ingestTelemetry } from "./lib/telemetry.js";
 import { advanceIncidentWorkflow, parseWorkflowAction } from "./lib/workflow.js";
-import { listSimulatorTargets, parseSimulatorFault, simulateFault, simulateRepair } from "./lib/simulator.js";
+import { listSimulatorTargets, parseSimulatorFault, parseSimulatorNoise, simulateFault, simulateNoise, simulateNoiseRepair, simulateRepair } from "./lib/simulator.js";
 
 const logger =
   process.env.NODE_ENV === "production"
@@ -172,6 +172,36 @@ app.post("/api/simulator/repair", async (request, reply) => {
       return reply.code(400).send({ error: "simulator_repair_failed", message: error.message });
     }
     return reply.code(500).send({ error: "simulator_repair_failed" });
+  }
+});
+
+app.post("/api/simulator/noise", async (request, reply) => {
+  try {
+    const input = parseSimulatorNoise(request.body);
+    return reply.send(await simulateNoise(input));
+  } catch (error) {
+    if (error instanceof ZodError) {
+      return reply.code(400).send({ error: "invalid_simulator_payload", message: error.message });
+    }
+    if (error instanceof Error) {
+      return reply.code(400).send({ error: "simulator_noise_failed", message: error.message });
+    }
+    return reply.code(500).send({ error: "simulator_noise_failed" });
+  }
+});
+
+app.post("/api/simulator/noise-repair", async (request, reply) => {
+  try {
+    const input = parseSimulatorNoise(request.body);
+    return reply.send(await simulateNoiseRepair(input));
+  } catch (error) {
+    if (error instanceof ZodError) {
+      return reply.code(400).send({ error: "invalid_simulator_payload", message: error.message });
+    }
+    if (error instanceof Error) {
+      return reply.code(400).send({ error: "simulator_noise_repair_failed", message: error.message });
+    }
+    return reply.code(500).send({ error: "simulator_noise_repair_failed" });
   }
 });
 

@@ -10,7 +10,20 @@ const simulatorFaultSchema = z.object({
   spanToPoleId: z.string().min(1).optional(),
 });
 
+const simulatorNoiseSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("dead_sensor"),
+    poleId: z.string().min(1),
+  }),
+  z.object({
+    kind: z.literal("scheduled_outage"),
+    scopeType: z.enum(["feeder", "dt"]),
+    targetId: z.string().min(1),
+  }),
+]);
+
 export type SimulatorFaultInput = z.infer<typeof simulatorFaultSchema>;
+export type SimulatorNoiseInput = z.infer<typeof simulatorNoiseSchema>;
 
 export type SimulatorTarget = {
   feederId: string;
@@ -19,6 +32,8 @@ export type SimulatorTarget = {
   deviceCount: number;
   hasRecordedTopology: boolean;
   exampleSpan: { fromPoleId: string; toPoleId: string } | null;
+  samplePoleId: string | null;
+  sampleDevicePoleId: string | null;
 };
 
 export type SimulatorTargetsResult = {
@@ -105,6 +120,8 @@ async function getTargets(): Promise<SimulatorTargetsResult> {
     }
 
     const exampleParent = dtPoles.find((pole) => pole.parentPoleId !== null);
+    const samplePole = dtPoles[0] ?? null;
+    const sampleDevicePole = dtPoles.find((pole) => devicePoleIds.has(pole.poleId)) ?? null;
     return {
       feederId: transformer.feederId,
       dtId: transformer.dtId,
@@ -112,6 +129,8 @@ async function getTargets(): Promise<SimulatorTargetsResult> {
       deviceCount: deviceCountByDt.get(transformer.dtId) ?? 0,
       hasRecordedTopology: dtPoles.some((pole) => pole.parentPoleId !== null),
       exampleSpan: exampleParent && exampleParent.parentPoleId ? { fromPoleId: exampleParent.parentPoleId, toPoleId: exampleParent.poleId } : null,
+      samplePoleId: samplePole?.poleId ?? null,
+      sampleDevicePoleId: sampleDevicePole?.poleId ?? null,
     };
   });
 
@@ -171,6 +190,22 @@ async function getDeviceTriggers(poleIds: string[], mode: "fault" | "repair") {
   }
 
   return events;
+}
+
+async function resolveScopePoleIds(scopeType: "feeder" | "dt", targetId: string): Promise<string[]> {
+  if (scopeType === "feeder") {
+    const poles = await prisma.pole.findMany({
+      where: { feederId: targetId },
+      select: { poleId: true },
+    });
+    return poles.map((pole) => pole.poleId);
+  }
+
+  const poles = await prisma.pole.findMany({
+    where: { dtId: targetId },
+    select: { poleId: true },
+  });
+  return poles.map((pole) => pole.poleId);
 }
 
 async function scopeToPoles(input: SimulatorFaultInput): Promise<{ scopeName: string; poleIds: string[]; triggerPoleId: string | null; isSpan: boolean }> {
@@ -270,4 +305,240 @@ export async function simulateFault(input: SimulatorFaultInput) {
 
 export async function simulateRepair(input: SimulatorFaultInput) {
   return applySimulation(input, "repair");
+}
+
+async function buildNoiseTelemetry(poleIds: string[], mode: "fault" | "repair") {
+  const devices = await prisma.device.findMany({
+    where: { poleId: { in: poleIds } },
+    select: { deviceId: true, poleId: true, firmwareVersion: true, batteryMv: true, rssi: true },
+    orderBy: [{ deviceId: "asc" }],
+  });
+  const states = await prisma.deviceState.findMany({
+    where: { deviceId: { in: devices.map((device) => device.deviceId) } },
+    select: { deviceId: true, lastSeq: true },
+  });
+  const stateByDevice = new Map(states.map((state) => [state.deviceId, state]));
+  const now = new Date().toISOString();
+  const events: Array<Record<string, unknown>> = [];
+
+  for (const device of devices.slice(0, 5)) {
+    const seq = (stateByDevice.get(device.deviceId)?.lastSeq ?? 0) + 1;
+    const common = {
+      device_id: device.deviceId,
+      pole_id: device.poleId,
+      ts: now,
+      seq,
+      battery_mv: device.batteryMv ?? 3500,
+      rssi: device.rssi ?? -85,
+      fw: device.firmwareVersion,
+    };
+
+    if (mode === "fault") {
+      if (device.firmwareVersion.startsWith("1.2")) {
+        continue;
+      }
+      if (Math.random() > 0.7) {
+        continue;
+      }
+      events.push({ ...common, event: "power_lost", energized: false });
+    } else {
+      events.push({ ...common, event: "boot", energized: true });
+      events.push({ ...common, seq: seq + 1, event: "power_restored", energized: true });
+    }
+  }
+
+  return events;
+}
+
+export function parseSimulatorNoise(input: unknown): SimulatorNoiseInput {
+  return simulatorNoiseSchema.parse(input);
+}
+
+export async function simulateNoise(input: SimulatorNoiseInput) {
+  if (input.kind === "dead_sensor") {
+    const device = await prisma.device.findUnique({
+      where: { poleId: input.poleId },
+      select: { deviceId: true, poleId: true },
+    });
+
+    if (!device) {
+      throw new Error(`No device found for pole ${input.poleId}`);
+    }
+
+    await prisma.device.update({
+      where: { deviceId: device.deviceId },
+      data: {
+        active: false,
+        lastSeenAt: new Date(),
+      },
+    });
+
+    await prisma.deviceState.upsert({
+      where: { deviceId: device.deviceId },
+      create: {
+        deviceId: device.deviceId,
+        online: false,
+        bootCount: 0,
+        lastSeq: null,
+        lastEventType: null,
+        lastEventAt: new Date(),
+        lastHeartbeatAt: null,
+        lastTelemetryId: null,
+      },
+      update: {
+        online: false,
+        lastEventAt: new Date(),
+      },
+    });
+
+    return {
+      kind: input.kind,
+      targetId: input.poleId,
+      affectedPoles: 1,
+      triggerEvents: 0,
+      mode: "fault" as const,
+      incidents: [],
+    };
+  }
+
+  const poleIds = await resolveScopePoleIds(input.scopeType, input.targetId);
+  if (poleIds.length === 0) {
+    throw new Error(`No poles found for ${input.scopeType} ${input.targetId}`);
+  }
+
+  const outageId = `SIM-${input.scopeType}-${input.targetId}`;
+  const now = new Date();
+  await prisma.scheduledOutage.upsert({
+    where: { externalId: outageId },
+    create: {
+      externalId: outageId,
+      scope: input.scopeType,
+      targetId: input.targetId,
+      startsAt: new Date(now.getTime() - 20 * 60_000),
+      endsAt: new Date(now.getTime() + 90 * 60_000),
+      reason: "Simulated scheduled outage",
+      status: "active",
+      source: "simulator",
+    },
+    update: {
+      startsAt: new Date(now.getTime() - 20 * 60_000),
+      endsAt: new Date(now.getTime() + 90 * 60_000),
+      status: "active",
+      source: "simulator",
+    },
+  });
+
+  await prisma.poleState.updateMany({
+    where: { poleId: { in: poleIds } },
+    data: {
+      energized: false,
+      lastEventType: "power_lost",
+      lastEventAt: now,
+    },
+  });
+
+  const events = await buildNoiseTelemetry(poleIds, "fault");
+  const telemetryResult = events.length > 0 ? await ingestTelemetry(events) : null;
+  const incidents = await prisma.incident.findMany({
+    where: { scopeType: input.scopeType, scopeId: input.targetId },
+    orderBy: [{ createdAt: "desc" }],
+    take: 5,
+    select: { id: true, status: true, faultType: true, scopeType: true, scopeId: true, confidence: true, reason: true },
+  });
+
+  return {
+    kind: input.kind,
+    targetId: input.targetId,
+    affectedPoles: poleIds.length,
+    triggerEvents: telemetryResult?.accepted ?? 0,
+    mode: "fault" as const,
+    incidents,
+  };
+}
+
+export async function simulateNoiseRepair(input: SimulatorNoiseInput) {
+  if (input.kind === "dead_sensor") {
+    const device = await prisma.device.findUnique({
+      where: { poleId: input.poleId },
+      select: { deviceId: true, poleId: true },
+    });
+
+    if (!device) {
+      throw new Error(`No device found for pole ${input.poleId}`);
+    }
+
+    await prisma.device.update({
+      where: { deviceId: device.deviceId },
+      data: {
+        active: true,
+        lastSeenAt: new Date(),
+      },
+    });
+
+    await prisma.deviceState.upsert({
+      where: { deviceId: device.deviceId },
+      create: {
+        deviceId: device.deviceId,
+        online: true,
+        bootCount: 0,
+        lastSeq: null,
+        lastEventType: "boot",
+        lastEventAt: new Date(),
+        lastHeartbeatAt: new Date(),
+        lastTelemetryId: null,
+      },
+      update: {
+        online: true,
+        lastEventType: "boot",
+        lastEventAt: new Date(),
+        lastHeartbeatAt: new Date(),
+      },
+    });
+
+    return {
+      kind: input.kind,
+      targetId: input.poleId,
+      affectedPoles: 1,
+      triggerEvents: 0,
+      mode: "repair" as const,
+      incidents: [],
+    };
+  }
+
+  const poleIds = await resolveScopePoleIds(input.scopeType, input.targetId);
+  if (poleIds.length === 0) {
+    throw new Error(`No poles found for ${input.scopeType} ${input.targetId}`);
+  }
+
+  await prisma.scheduledOutage.updateMany({
+    where: { scope: input.scopeType, targetId: input.targetId, source: "simulator" },
+    data: { status: "completed" },
+  });
+
+  await prisma.poleState.updateMany({
+    where: { poleId: { in: poleIds } },
+    data: {
+      energized: true,
+      lastEventType: "power_restored",
+      lastEventAt: new Date(),
+    },
+  });
+
+  const events = await buildNoiseTelemetry(poleIds, "repair");
+  const telemetryResult = events.length > 0 ? await ingestTelemetry(events) : null;
+  const incidents = await prisma.incident.findMany({
+    where: { scopeType: input.scopeType, scopeId: input.targetId },
+    orderBy: [{ createdAt: "desc" }],
+    take: 5,
+    select: { id: true, status: true, faultType: true, scopeType: true, scopeId: true, confidence: true, reason: true },
+  });
+
+  return {
+    kind: input.kind,
+    targetId: input.targetId,
+    affectedPoles: poleIds.length,
+    triggerEvents: telemetryResult?.accepted ?? 0,
+    mode: "repair" as const,
+    incidents,
+  };
 }
